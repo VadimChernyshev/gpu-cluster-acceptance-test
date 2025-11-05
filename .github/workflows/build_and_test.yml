@@ -11,12 +11,15 @@ env:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux]
     permissions:
       contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Verify Docker availability
+        run: docker info
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -24,7 +27,7 @@ jobs:
       - name: Build container image
         run: docker build -t "${LOCAL_IMAGE}" .
 
-      - name: Run smoke test (CPU mode)
+      - name: Run smoke test
         run: |
           docker run --rm \
             -e CUDA_VISIBLE_DEVICES="" \
