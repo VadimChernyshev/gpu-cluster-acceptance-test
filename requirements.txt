@@ -1,0 +1,3 @@
+# Additional libraries for DistilBERT fine-tuning outside the container.
+transformers==4.44.2
+datasets==2.20.0
