@@ -14,7 +14,6 @@ This repository packages a fixed-configuration DistilBERT fine-tuning job on the
 
 - Docker with NVIDIA Container Toolkit on GPU hosts
 - Internet access the first time you download DistilBERT weights and GLUE SST-2 splits
-- Optional: Python ≥3.10 if executing the scripts directly outside Docker
 
 ## Quick Start
 
@@ -30,74 +29,91 @@ docker build -t gpu-cluster-training-test .
 docker run --rm --gpus all gpu-cluster-training-test
 ```
 
-### Submit on SLURM
+### Run on a single node with multiple GPUs
 
-Example `sbatch` script for a four-node run, one GPU per node:
-
-```bash
-#!/bin/bash
-#SBATCH --job-name=distilbert-acceptance
-#SBATCH -N 4
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --ntasks-per-node=1
-#SBATCH --exclusive
-#SBATCH --output=O-%x_%j.log
-#SBATCH --error=E-%x_%j.log
-
-MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
-MASTER_PORT=12345
-IMAGE="ghcr.io/vadimchernyshev/distilbert-sst2-test:latest"
-
-echo "MASTER_ADDR=$MASTER_ADDR"
-echo "MASTER_PORT=$MASTER_PORT"
-echo "SLURM_JOB_NODELIST=$SLURM_JOB_NODELIST"
-echo "WORLD_SIZE=$SLURM_NTASKS"
-
-echo "[INFO] Pulling image on all nodes..."
-srun -N $SLURM_NNODES docker pull $IMAGE
-
-srun docker run --rm --gpus all \
-  -e MASTER_ADDR=$MASTER_ADDR \
-  -e MASTER_PORT=$MASTER_PORT \
-  -e WORLD_SIZE=$SLURM_NTASKS \
-  -e RANK=$SLURM_PROCID \
-  -e LOCAL_RANK=$SLURM_LOCALID \
-  -e CUDA_VISIBLE_DEVICES=0 \
-  -e HF_HOME=/cache/hf \
-  -e HF_DATASETS_CACHE=/cache/hf/datasets \
-  -e TRANSFORMERS_CACHE=/cache/hf/transformers \
-  -v /mnt/fast-cache:/cache \
-  $IMAGE
-```
-
-### Multi-node launch
-
-Use `torchrun` (or `python -m torch.distributed.run`). Example on two nodes with four GPUs each:
-
-```bash
-torchrun \
-  --nproc_per_node=4 \
-  --nnodes=2 \
-  --node_rank=${NODE_RANK} \
-  --master_addr=${MASTER_ADDR} \
-  --master_port=${MASTER_PORT:-29500} \
-  train_ddp.py
-```
-
-When running inside the container, override the entrypoint:
+Use `torchrun` to spawn one process per GPU. Inside the container:
 
 ```bash
 docker run --rm --gpus all \
   --entrypoint torchrun \
   gpu-cluster-training-test \
   --nproc_per_node=4 \
-  --nnodes=2 \
-  --node_rank=${NODE_RANK} \
-  --master_addr=${MASTER_ADDR} \
-  --master_port=${MASTER_PORT:-29500} \
   /workspace/train_ddp.py
 ```
+
+Adjust `--nproc_per_node` to match how many GPUs you want to use on the node.
+
+### Submit on SLURM
+
+Create two helper scripts for launching on a SLURM-managed cluster. The first submits the job, pulls the container on all nodes, and fans out the per-task script; the second runs inside each task, wires up the environment variables, and starts the container.
+
+`sbatch.sh` (4 nodes, 1 GPU per node):
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=distilbert-acceptance
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --export=ALL
+#SBATCH -D .
+#SBATCH --output=logs/O-%x_%j.log
+#SBATCH --error=logs/E-%x_%j.log
+
+set -euo pipefail
+
+IMAGE="ghcr.io/vadimchernyshev/distilbert-sst2-test:latest"
+
+echo "[INFO] Pulling image on all nodes..."
+srun -N "$SLURM_NNODES" docker pull "$IMAGE"
+
+echo "[INFO] Launching containers..."
+srun --nodes="$SLURM_NNODES" bash ./srun.sh
+```
+
+`srun.sh`:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+MASTER_PORT=12347
+IMAGE="ghcr.io/vadimchernyshev/distilbert-sst2-test:latest"
+
+echo "MASTER_ADDR=$MASTER_ADDR"
+echo "MASTER_PORT=$MASTER_PORT"
+echo "SLURM_JOB_NODELIST=$SLURM_JOB_NODELIST"
+echo "WORLD_SIZE=$SLURM_NTASKS"
+echo "Starting on node: $(hostname) | rank=$SLURM_PROCID local_rank=$SLURM_LOCALID world_size=$SLURM_NTASKS"
+
+docker run --rm \
+  --network=host \
+  -e MASTER_ADDR="$MASTER_ADDR" \
+  -e MASTER_PORT="$MASTER_PORT" \
+  -e WORLD_SIZE="$SLURM_NTASKS" \
+  -e RANK="$SLURM_PROCID" \
+  -e LOCAL_RANK="$SLURM_LOCALID" \
+  -e SLURM_PROCID="$SLURM_PROCID" \
+  -e SLURM_LOCALID="$SLURM_LOCALID" \
+  -e SLURM_NTASKS="$SLURM_NTASKS" \
+  "$IMAGE" 2>&1 | tee "logs/training.log"
+```
+
+Before submitting, make the scripts executable and prepare the log directory:
+
+```bash
+mkdir -p logs
+chmod +x sbatch.sh srun.sh
+```
+
+Submit with:
+
+```bash
+sbatch sbatch.sh
+```
+
 
 ### Smoke tests / short runs
 
@@ -117,13 +133,5 @@ docker run --rm \
 ```
 
 The script downloads the DistilBERT model and tokenizer, performs a forward pass, executes a tiny backward pass, and exits successfully if everything works.
-
-## Continuous Integration
-
-The GitHub Actions workflow at `.github/workflows/build_and_test.yml`:
-
-1. Builds the container image.
-2. Runs the CPU-mode smoke test inside the container (`test_smoke.py`).
-
 
 Extend `train_ddp.py` or patch the module constants if you need different hyperparameters, evaluation loops, or custom metrics for your validation workflows.

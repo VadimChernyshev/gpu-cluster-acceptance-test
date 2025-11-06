@@ -48,7 +48,7 @@ def init_dist():
 
 
 def build_dataloader(rank, world_size, device, distributed):
-    raw_train = load_dataset("glue", "sst2", split="train[:1000]")
+    raw_train = load_dataset("glue", "sst2", split="train")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
     collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
@@ -95,9 +95,11 @@ def main():
 
     rank, world_size, local_rank, device, distributed = init_dist()
 
-    if rank == 0:
-        mode = "DDP" if distributed else "single-process"
-        print(f"[rank 0] mode={mode}, world_size={world_size}, device={device}, model={MODEL_NAME}")
+    mode = "DDP" if distributed else "single-process"
+    device_kind = "GPU" if device.type == "cuda" else "CPU"
+    print(f"TRAINING MODE={mode.upper()} WORLD_SIZE={world_size} DEVICE={device} MODEL={MODEL_NAME}")
+    print(f"RUNNING ON {device_kind}!")
+    print(f"rank={rank}")
 
     train_loader = build_dataloader(rank, world_size, device, distributed)
 
@@ -136,7 +138,7 @@ def main():
 
             if rank == 0 and ((step + 1) % LOG_INTERVAL == 0 or step == 0):
                 avg_loss = (total_loss / total_examples).item()
-                print(f"[rank 0] epoch={epoch} step={step + 1} avg_loss={avg_loss:.4f}")
+                print(f"epoch={epoch} step={step + 1} avg_loss={avg_loss:.4f}")
 
         if distributed:
             dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -144,14 +146,14 @@ def main():
 
         if rank == 0 and total_examples.item() > 0:
             epoch_loss = (total_loss / total_examples).item()
-            print(f"[rank 0] epoch={epoch} train_loss={epoch_loss:.4f}")
+            print(f"epoch={epoch} train_loss={epoch_loss:.4f}")
 
     if distributed:
         dist.barrier()
         dist.destroy_process_group()
 
     if rank == 0:
-        print(f"[rank 0] Finished in {time.time() - start:.2f}s.")
+        print(f"Finished in {time.time() - start:.2f}s.")
 
 
 if __name__ == "__main__":
