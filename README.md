@@ -6,28 +6,69 @@ This repository packages a fixed-configuration DistilBERT fine-tuning job on the
 
 - `Dockerfile` – container definition based on `nvcr.io/nvidia/pytorch:24.07-py3`
 - `train_ddp.py` – distributed training script (runs as-is, no CLI parameters)
+- `test_smoke.py` – quick functional smoke test used by CI and local checks
 - `requirements.txt` – additional Python dependencies (Transformers + Datasets)
-- `ci/build_and_test.yaml` – reference pipeline for non-GitHub CI systems
-- `.github/workflows/build.yml` – GitHub Actions pipeline for build/test/push
+- `.github/workflows/build_and_test.yml` – GitHub Actions workflow that builds the image and runs the smoke test
 
 ## Prerequisites
 
 - Docker with NVIDIA Container Toolkit on GPU hosts
 - Internet access the first time you download DistilBERT weights and GLUE SST-2 splits
-- Optional: Python ≥3.10 if executing the script directly outside Docker
+- Optional: Python ≥3.10 if executing the scripts directly outside Docker
 
 ## Quick Start
 
 ### Build the container
 
 ```bash
-docker build -t distilbert-sst2-test .
+docker build -t gpu-cluster-training-test .
 ```
 
 ### Run on a GPU node
 
 ```bash
-docker run --rm --gpus all distilbert-sst2-test
+docker run --rm --gpus all gpu-cluster-training-test
+```
+
+### Submit on SLURM
+
+Example `sbatch` script for a four-node run, one GPU per node:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=distilbert-acceptance
+#SBATCH -N 4
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --exclusive
+#SBATCH --output=O-%x_%j.log
+#SBATCH --error=E-%x_%j.log
+
+MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+MASTER_PORT=12345
+IMAGE="ghcr.io/vadimchernyshev/distilbert-sst2-test:latest"
+
+echo "MASTER_ADDR=$MASTER_ADDR"
+echo "MASTER_PORT=$MASTER_PORT"
+echo "SLURM_JOB_NODELIST=$SLURM_JOB_NODELIST"
+echo "WORLD_SIZE=$SLURM_NTASKS"
+
+echo "[INFO] Pulling image on all nodes..."
+srun -N $SLURM_NNODES docker pull $IMAGE
+
+srun docker run --rm --gpus all \
+  -e MASTER_ADDR=$MASTER_ADDR \
+  -e MASTER_PORT=$MASTER_PORT \
+  -e WORLD_SIZE=$SLURM_NTASKS \
+  -e RANK=$SLURM_PROCID \
+  -e LOCAL_RANK=$SLURM_LOCALID \
+  -e CUDA_VISIBLE_DEVICES=0 \
+  -e HF_HOME=/cache/hf \
+  -e HF_DATASETS_CACHE=/cache/hf/datasets \
+  -e TRANSFORMERS_CACHE=/cache/hf/transformers \
+  -v /mnt/fast-cache:/cache \
+  $IMAGE
 ```
 
 ### Multi-node launch
@@ -49,7 +90,7 @@ When running inside the container, override the entrypoint:
 ```bash
 docker run --rm --gpus all \
   --entrypoint torchrun \
-  distilbert-sst2-test \
+  gpu-cluster-training-test \
   --nproc_per_node=4 \
   --nnodes=2 \
   --node_rank=${NODE_RANK} \
@@ -60,45 +101,29 @@ docker run --rm --gpus all \
 
 ### Smoke tests / short runs
 
-For quick validation (e.g., CI), import the module and tweak the top-level constants before calling `main()`:
+For quick validation (e.g., CI or pre-flight checks) execute the bundled script:
 
 ```bash
-python - <<'PY'
-import train_ddp
-from datasets import load_dataset as hf_load_dataset
-
-def sliced_dataset(*args, **kwargs):
-    if kwargs.get("split") == "train":
-        kwargs["split"] = "train[:2%]"
-    return hf_load_dataset(*args, **kwargs)
-
-train_ddp.load_dataset = sliced_dataset
-train_ddp.BATCH_SIZE = 8
-train_ddp.NUM_WORKERS = 0
-train_ddp.main()
-PY
+python test_smoke.py
 ```
 
-Adjust the split fraction as needed for larger or smaller smoke tests.
+Or through the container:
+
+```bash
+docker run --rm \
+  --entrypoint python \
+  gpu-cluster-training-test \
+  test_smoke.py
+```
+
+The script downloads the DistilBERT model and tokenizer, performs a forward pass, executes a tiny backward pass, and exits successfully if everything works.
 
 ## Continuous Integration
 
-Both CI definitions follow the same flow:
+The GitHub Actions workflow at `.github/workflows/build_and_test.yml`:
 
-1. Build the container image.
-2. Run a CPU-mode smoke test that monkey-patches the dataset loader to use a small subset.
-3. On pushes to `main`, push the resulting image to `ghcr.io/<owner>/<repo>`.
+1. Builds the container image.
+2. Runs the CPU-mode smoke test inside the container (`test_smoke.py`).
 
-Ensure the GitHub workflow token has `packages: write` scope so the push to GHCR succeeds.
 
-## Local Development (without Docker)
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cu121  # or the CPU wheel
-pip install -r requirements.txt
-python train_ddp.py
-```
-
-Extend `train_ddp.py` or monkey-patch the constants (as in the smoke test snippet) if you need different hyperparameters, evaluation loops, or custom metrics for your validation workflows.
+Extend `train_ddp.py` or patch the module constants if you need different hyperparameters, evaluation loops, or custom metrics for your validation workflows.
